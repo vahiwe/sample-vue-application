@@ -1,0 +1,601 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  CloudFormation template to create codepipeline, codebuild, S3 bucket, and cloudfront distribution.
+  This template easily manages deployment of compiled code to a production environment.
+Parameters:
+  CodePipelineName:
+    Description: Name for CodePipeline.
+    Type: String
+    Default: deployment-pipeline
+  Branch:
+    Description: 'Git branch to pull.'
+    Type: String
+    Default: 'main'
+  CodeStarConnectionARN:  
+    Type: String
+    Description: 'CodeStar Connection ARN'
+    Default: ''
+  RepositoryName:
+    Type: String
+    Description: 'Git Repository Name'
+    Default: ''
+
+Resources:
+  CodeBuildRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+
+  CodeBuildPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      Description: Policy with base permissions for CodeBuild
+      Path: /
+      Roles:
+        - !Ref CodeBuildRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:PutLogEvents"
+              - "logs:CreateLogStream"
+            Resource:
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+          - Effect: Allow
+            Action:
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+              - 's3:GetBucketVersioning'
+              - 's3:PutObject'
+              - "s3:GetBucketAcl"
+              - "s3:GetBucketLocation"
+            Resource:
+              - !GetAtt ArtifactStoreBucket.Arn
+              - !Sub "${ArtifactStoreBucket.Arn}/*"
+          - Effect: Allow
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: !GetAtt KMSKey.Arn
+          - Effect: Allow  #For allowing CodeBuild to Access Secrets Manager to retrieve Private SSH key. If a custom KMS key is used, please add the ARN in the Resource section
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/secretsmanager"
+
+  CodeBuild:
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        Type: LINUX_CONTAINER
+      ServiceRole: !Ref CodeBuildRole
+      Source:
+        Type: CODEPIPELINE
+
+  S3WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+  
+  CloudFrontOriginIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: 'origin identity'
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+              AWS: !Sub 'arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontOriginIdentity}'
+          Action:
+          - s3:GetObject
+          Resource:
+          - !Join [ "", [ "arn:aws:s3:::", !Ref S3WebsiteBucket, "/*" ] ]
+
+  CloudfrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        CustomErrorResponses:
+          - ErrorCode: 403 # not found
+            ResponseCode: 404
+            ResponsePagePath: '/index.html'
+        Comment: S3-Cloudfront
+        DefaultRootObject: index.html
+        Enabled: true
+        Origins:
+          - DomainName: !GetAtt S3WebsiteBucket.DomainName
+            Id: !Ref S3WebsiteBucket
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOriginIdentity}'
+        DefaultCacheBehavior:
+          TargetOriginId: !Ref S3WebsiteBucket
+          ForwardedValues:
+            QueryString: false
+          ViewerProtocolPolicy: redirect-to-https
+          MinTTL: 0
+          AllowedMethods:
+            - HEAD
+            - GET
+          CachedMethods:
+            - HEAD
+            - GET
+          DefaultTTL: 86400
+          MaxTTL: 31536000
+          SmoothStreaming: false
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  PipelineRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+
+  CodePipelinePolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      Description: Policy with base permissions for CodePipeline
+      Path: /
+      Roles:
+        - !Ref PipelineRole
+      PolicyDocument:
+        Statement:
+        - Action:
+            - 's3:GetObject'
+            - 's3:GetObjectVersion'
+            - 's3:GetBucketVersioning'
+            - 's3:PutObject'
+            - "s3:GetBucketAcl"
+            - "s3:GetBucketLocation"
+          Resource:
+            - !GetAtt ArtifactStoreBucket.Arn
+            - !Sub "${ArtifactStoreBucket.Arn}/*"
+          Effect: Allow
+        - Action:
+            - 'iam:PassRole'
+          Resource: '*'
+          Effect: Allow
+        - Action:
+            - "codedeploy:CreateDeployment"
+            - "codedeploy:GetApplication"
+            - "codedeploy:GetApplicationRevision"
+            - "codedeploy:GetDeployment"
+            - "codedeploy:GetDeploymentConfig"
+            - "codedeploy:RegisterApplicationRevision"
+          Resource: '*'
+          Effect: Allow
+        - Action:
+            - 'codestar-connections:UseConnection'
+          Resource: '*'
+          Effect: Allow
+        - Action:
+            - "cloudformation:CreateStack"
+            - "cloudformation:DeleteStack"
+            - "cloudformation:DescribeStacks"
+            - "cloudformation:UpdateStack"
+            - "cloudformation:CreateChangeSet"
+            - "cloudformation:DeleteChangeSet"
+            - "cloudformation:DescribeChangeSet"
+            - "cloudformation:ExecuteChangeSet"
+            - "cloudformation:SetStackPolicy"
+            - "cloudformation:ValidateTemplate"
+          Resource: '*'
+          Effect: Allow
+        - Action:
+            - "lambda:InvokeFunction"
+            - "lambda:ListFunctions"
+          Resource: '*'
+          Effect: Allow
+        - Action:
+            - "opsworks:CreateDeployment"
+            - "opsworks:DescribeApps"
+            - "opsworks:DescribeCommands"
+            - "opsworks:DescribeDeployments"
+            - "opsworks:DescribeInstances"
+            - "opsworks:DescribeStacks"
+            - "opsworks:UpdateApp"
+            - "opsworks:UpdateStack"
+          Resource: '*'
+          Effect: Allow
+        - Action:
+            - "elasticbeanstalk:*"
+            - "ec2:*"
+            - "elasticloadbalancing:*"
+            - "autoscaling:*"
+            - "cloudwatch:*"
+            - "s3:*"
+            - "sns:*"
+            - "cloudformation:*"
+            - "rds:*"
+            - "sqs:*"
+            - "ecs:*"
+          Resource: '*'
+          Effect: Allow
+        - Action:
+            - "codecommit:CancelUploadArchive"
+            - "codecommit:GetBranch"
+            - "codecommit:GetCommit"
+            - "codecommit:GetRepository"
+            - "codecommit:GetUploadArchiveStatus"
+            - "codecommit:UploadArchive"
+          Resource: '*'
+          Effect: Allow
+        - Action:
+            - 'codebuild:BatchGetBuilds'
+            - 'codebuild:StartBuild'
+            - "codebuild:BatchGetBuildBatches"
+            - "codebuild:StartBuildBatch"
+            - "ecr:DescribeImages"
+          Resource: '*'
+          Effect: Allow
+        - Action:
+          - 'kms:Encrypt'
+          - 'kms:Decrypt'
+          - 'kms:ReEncrypt*'
+          - 'kms:GenerateDataKey*'
+          - 'kms:DescribeKey'
+          Resource: !GetAtt KMSKey.Arn
+          Effect: Allow
+        Version: 2012-10-17
+
+  Pipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactStoreBucket
+        EncryptionKey:
+          Id: !GetAtt KMSKey.Arn
+          Type: KMS
+      Name: !Ref CodePipelineName
+      RoleArn: !GetAtt PipelineRole.Arn
+      Stages:
+        - Name: 'Source'
+          Actions:
+            - Name: 'Source'
+              ActionTypeId:
+                Category: 'Source'
+                Owner: 'AWS'
+                Version: '1'
+                Provider: 'CodeStarSourceConnection'
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                ConnectionArn: !Ref CodeStarConnectionARN
+                FullRepositoryId: !Ref RepositoryName
+                BranchName: !Ref Branch
+                DetectChanges: true
+        - Name: 'Build'
+          Actions:
+            - Name: 'CodeBuild'
+              ActionTypeId:
+                Category: 'Build'
+                Owner: 'AWS'
+                Version: '1'
+                Provider: 'CodeBuild'
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref CodeBuild
+              RunOrder: 1
+        - Name: 'Deploy'
+          Actions:
+            - Name: 'Deploy'
+              ActionTypeId:
+                Category: 'Deploy'
+                Owner: 'AWS'
+                Version: '1'
+                Provider: 'S3'
+              InputArtifacts:
+                - Name: BuildArtifact
+              OutputArtifacts: []
+              Configuration:
+                BucketName: !Ref S3WebsiteBucket
+                Extract: 'true'
+              RunOrder: 1
+            - Name: LambdaDeploy
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              Configuration:
+                FunctionName: invalidateCloudfront
+                UserParameters: !Ref CloudfrontDistribution
+              RunOrder: 2
+                
+  ArtifactStoreBucket:
+    Type: 'AWS::S3::Bucket'
+
+  ArtifactStoreBucketCustomResource:
+    Type: Custom::S3CustomResource
+    Properties:
+      ServiceToken: !GetAtt AWSLambdaFunction.Arn
+      the_bucket: !Ref ArtifactStoreBucket
+
+  S3WebsiteBucketCustomResource:
+    Type: Custom::S3CustomResource
+    Properties:
+      ServiceToken: !GetAtt AWSLambdaFunction.Arn
+      the_bucket: !Ref S3WebsiteBucket
+
+  AWSLambdaFunction:
+     Type: "AWS::Lambda::Function"
+     Properties:
+       Description: "Work with S3 Buckets!"
+       FunctionName: !Sub '${AWS::StackName}-${AWS::Region}-lambda'
+       Handler: index.handler
+       Role: !GetAtt AWSLambdaExecutionRole.Arn
+       Timeout: 360
+       Runtime: python3.9
+       Code:
+         ZipFile: |
+          import boto3
+          import cfnresponse
+          def handler(event, context):
+              # Init ...
+              the_event = event['RequestType']
+              print("The event is: ", str(the_event))
+              response_data = {}
+              s_3 = boto3.client('s3')
+              # Retrieve parameters
+              the_bucket = event['ResourceProperties']['the_bucket']
+              try:
+                  if the_event in ('Create', 'Update'):
+                      print("Bucket Event for creation or update ", the_event)
+                  elif the_event == 'Delete':
+                      print("Deleting S3 content...")
+                      b_operator = boto3.resource('s3')
+                      b_operator.Bucket(str(the_bucket)).objects.all().delete()
+                  # Everything OK... send the signal back
+                  print("Operation successful!")
+                  cfnresponse.send(event,
+                                   context,
+                                   cfnresponse.SUCCESS,
+                                   response_data)
+              except Exception as e:
+                  print("Operation failed...")
+                  print(str(e))
+                  response_data['Data'] = str(e)
+                  cfnresponse.send(event,
+                                   context,
+                                   cfnresponse.FAILED,
+                                   response_data)
+
+  AWSLambdaExecutionRole:
+     Type: AWS::IAM::Role
+     Properties:
+       AssumeRolePolicyDocument:
+         Statement:
+         - Action:
+           - sts:AssumeRole
+           Effect: Allow
+           Principal:
+             Service:
+             - lambda.amazonaws.com
+         Version: '2012-10-17'
+       Path: "/"
+       Policies:
+       - PolicyDocument:
+           Statement:
+           - Action:
+             - logs:CreateLogGroup
+             - logs:CreateLogStream
+             - logs:PutLogEvents
+             Effect: Allow
+             Resource: arn:aws:logs:*:*:*
+           Version: '2012-10-17'
+         PolicyName: !Sub ${AWS::StackName}-${AWS::Region}-AWSLambda-CW
+       - PolicyDocument:
+           Statement:
+           - Action:
+             - s3:PutObject
+             - s3:DeleteObject
+             - s3:List*
+             Effect: Allow
+             Resource:
+             - !Sub arn:aws:s3:::${ArtifactStoreBucket}/*
+             - !Sub arn:aws:s3:::${ArtifactStoreBucket}
+             - !Sub arn:aws:s3:::${S3WebsiteBucket}/*
+             - !Sub arn:aws:s3:::${S3WebsiteBucket}
+           Version: '2012-10-17'
+         PolicyName: !Sub ${AWS::StackName}-${AWS::Region}-AWSLambda-S3
+       RoleName: !Sub ${AWS::StackName}-${AWS::Region}-AWSLambdaExecutionRole
+
+  InvalidateLambdaExecutionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: Lambda_Cloudfront_Invalidation
+      Description: "Policy to invalidate Cloudfront Distribution called inside a CodePipeline"
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: VisualEditor0
+            Effect: Allow
+            Action: cloudfront:CreateInvalidation
+            Resource: '*'
+          - Sid: VisualEditor1
+            Effect: Allow
+            Action: [
+              'codepipeline:PutJobSuccessResult',
+              'codepipeline:PutJobFailureResult'
+            ]
+            Resource: '*'
+          - Sid: VisualEditor2
+            Effect: Allow
+            Action: logs:*
+            Resource: '*'
+
+  InvalidateLambdaExecutedRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      ManagedPolicyArns: [
+        !Ref InvalidateLambdaExecutionPolicy
+      ]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+      Path: /
+      RoleName: LambdaExecutedRole_Invalidate
+
+  LambdaCloudfrontInvalidation:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: "index.handler"
+      FunctionName: invalidateCloudfront
+      Role:
+        Fn::GetAtt:
+          - "InvalidateLambdaExecutedRole"
+          - "Arn"
+      Code:
+        ZipFile: |
+          import time
+          import logging
+          from botocore.exceptions import ClientError
+          import boto3
+
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+
+          def codepipeline_success(job_id):
+              """
+              Puts CodePipeline Success Result
+              """
+              try:
+                  codepipeline = boto3.client('codepipeline')
+                  codepipeline.put_job_success_result(jobId=job_id)
+                  LOGGER.info('===SUCCESS===')
+                  return True
+              except ClientError as err:
+                  LOGGER.error("Failed to PutJobSuccessResult for CodePipeline!\n%s", err)
+                  return False
+
+          def codepipeline_failure(job_id, message):
+              try:
+                  codepipeline = boto3.client('codepipeline')
+                  codepipeline.put_job_failure_result(
+                      jobId=job_id,
+                      failureDetails={'type': 'JobFailed', 'message': message}
+                  )
+                  LOGGER.info('===FAILURE===')
+                  return True
+              except ClientError as err:
+                  LOGGER.error("Failed to PutJobFailureResult for CodePipeline!\n%s", err)
+                  return False
+
+
+          def handler(event, context):
+              LOGGER.info(event)
+              try:
+                  job_id = event['CodePipeline.job']['id']
+                  distId = event['CodePipeline.job']['data']['actionConfiguration']['configuration']['UserParameters']
+                  client = boto3.client('cloudfront')
+                  invalidation = client.create_invalidation(DistributionId=distId,
+                      InvalidationBatch={
+                          'Paths': {
+                              'Quantity': 1,
+                              'Items': ['/*']
+                      },
+                      'CallerReference': str(time.time())
+                  })
+                  codepipeline_success(job_id)
+                  
+              except KeyError as err:
+                  LOGGER.error("Could not retrieve CodePipeline Job ID!\n%s", err)
+                  return False
+                  codepipeline_failure(job_id, err)
+      Runtime: "python3.9"
+      Timeout: 25
+
+  KMSKey:
+    Type: 'AWS::KMS::Key'
+    Properties:
+      Description: 'git CodePipeline integration, bucket to store ssh keys'
+      KeyPolicy:
+        Version: 2012-10-17
+        Statement:
+          - Sid: Allow access for Key Administrators
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Join
+                  - ''
+                  - - 'arn:aws:iam::'
+                    - !Ref 'AWS::AccountId'
+                    - ':root'
+            Action:
+              - 'kms:Create*'
+              - 'kms:Describe*'
+              - 'kms:Enable*'
+              - 'kms:List*'
+              - 'kms:Put*'
+              - 'kms:Update*'
+              - 'kms:Revoke*'
+              - 'kms:Disable*'
+              - 'kms:Get*'
+              - 'kms:Delete*'
+              - 'kms:ScheduleKeyDeletion'
+              - 'kms:CancelKeyDeletion'
+            Resource: '*'
+          - Sid: Allow use of the key
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: '*'
+
+Outputs:
+  CloudfrontDistID:
+    Description: Cloudfront Distribution
+    Value:
+      !Ref CloudfrontDistribution
+  CloudfrontDomainName:
+    Description: Cloudfront Domain Name
+    Value:
+      !GetAtt CloudfrontDistribution.DomainName
